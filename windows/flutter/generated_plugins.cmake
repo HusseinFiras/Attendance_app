@@ -3,6 +3,7 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
+  camera_windows
   printing
   screen_retriever
   sqlite3_flutter_libs
