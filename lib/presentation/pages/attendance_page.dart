@@ -4,9 +4,12 @@ import 'package:camera_platform_interface/camera_platform_interface.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
 import 'dart:io';
+import 'dart:async';
 import 'dart:ui' as ui;
 import '../../../core/services/qr_service.dart';
 import '../../../core/services/camera_service.dart';
+import '../../../core/services/scanner_performance_service.dart';
+import '../../../core/config/qr_scanner_config.dart';
 
 class AttendancePage extends StatefulWidget {
   const AttendancePage({super.key});
@@ -296,22 +299,26 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
   List<CameraDescription> _cameras = [];
   int _selectedCameraIndex = 0;
   bool _isProcessing = false;
-  DateTime? _lastProcessedTime;
-  static const Duration _processingCooldown = Duration(milliseconds: 100); // Reduced cooldown for faster scanning
   bool _isInitializing = false;
   bool _isCameraActive = false;
-  final CameraService _cameraService = CameraService();
-  RouteObserver<ModalRoute<void>>? _routeObserver;
+  int _initializationAttempts = 0;
   
-  // Configure barcode scanner for QR codes only
+  final CameraService _cameraService = CameraService();
+  final ScannerPerformanceService _performanceService = ScannerPerformanceService();
+  RouteObserver<ModalRoute<void>>? _routeObserver;
+  Timer? _initializationTimeout;
+  
+  // Configure barcode scanner for QR codes only with specific options
   final BarcodeScanner _barcodeScanner = BarcodeScanner(
     formats: [BarcodeFormat.qrCode],
   );
 
-  // Debug mode for raw QR data
+  // Debug and UI state
   bool _debugMode = true;
   String _lastDetectedData = '';
   bool _isCurrentlyScanning = false;
+  String? _lastError;
+  bool _showSuccessAnimation = false;
 
   @override
   void initState() {
@@ -329,6 +336,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
 
   @override
   void dispose() {
+    _cancelInitializationTimeout();
     WidgetsBinding.instance.removeObserver(this);
     _routeObserver?.unsubscribe(this);
     _disposeCamera();
@@ -336,23 +344,37 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
     super.dispose();
   }
 
-  @override
-  void didPushNext() {
-    // Called when navigating away from this page
-    _disposeCamera();
+  void _cancelInitializationTimeout() {
+    _initializationTimeout?.cancel();
+    _initializationTimeout = null;
   }
 
-  @override
-  void didPopNext() {
-    // Called when returning to this page
-    if (!_isCameraActive && mounted) {
-      Future.delayed(const Duration(milliseconds: 500), _initializeCamera);
+  void _startInitializationTimeout() {
+    _cancelInitializationTimeout();
+    _initializationTimeout = Timer(QRScannerConfig.initializationTimeout, () {
+      if (!_isInitialized && mounted) {
+        debugPrint('Camera initialization timeout - attempting recovery');
+        _resetInitialization();
+      }
+    });
+  }
+
+  void _resetInitialization() {
+    _isInitializing = false;
+    _initializationAttempts = 0;
+    _performanceService.reset();
+    if (mounted) {
+      setState(() {
+        _lastError = 'Camera initialization timed out';
+      });
     }
   }
 
   Future<void> _disposeCamera() async {
     try {
       _isCameraActive = false;
+      _cancelInitializationTimeout();
+      
       final controller = _controller;
       if (controller != null) {
         if (controller.value.isStreamingImages) {
@@ -370,28 +392,34 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
 
   Future<void> _initializeCamera() async {
     if (_isInitializing || _isCameraActive) return;
+    if (_initializationAttempts >= QRScannerConfig.maxInitializationAttempts) {
+      debugPrint('Max initialization attempts reached');
+      _resetInitialization();
+      return;
+    }
+
     _isInitializing = true;
+    _initializationAttempts++;
+    _startInitializationTimeout();
     
     try {
       if (_controller != null) {
         await _disposeCamera();
-        await Future.delayed(const Duration(milliseconds: 300));
+        await Future.delayed(QRScannerConfig.recoveryDelay);
       }
 
       _cameras = await availableCameras();
       if (_cameras.isEmpty) {
-        debugPrint('No cameras available');
-        _isInitializing = false;
-        return;
+        throw Exception('No cameras available');
       }
 
       final indexToUse = _selectedCameraIndex < _cameras.length ? _selectedCameraIndex : 0;
       
       final controller = CameraController(
         _cameras[indexToUse],
-        ResolutionPreset.high, // Higher resolution for better QR detection
-        enableAudio: false,
-        imageFormatGroup: Platform.isWindows ? ImageFormatGroup.bgra8888 : ImageFormatGroup.jpeg,
+        QRScannerConfig.resolution,
+        enableAudio: QRScannerConfig.cameraConfig['enableAudio'],
+        imageFormatGroup: QRScannerConfig.imageFormat,
       );
 
       _controller = controller;
@@ -399,21 +427,12 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
 
       await controller.initialize();
       
-      // Configure camera for optimal QR scanning on Windows
-      if (Platform.isWindows) {
-        try {
-          await controller.setExposureMode(ExposureMode.auto);
-          debugPrint('Camera exposure mode set to auto');
-        } catch (e) {
-          debugPrint('Warning: Could not set exposure mode: $e');
-        }
-      }
-
       if (mounted) {
         setState(() {
           _selectedCameraIndex = indexToUse;
           _isInitialized = true;
           _isCameraActive = true;
+          _lastError = null;
         });
         await _startImageStream();
       }
@@ -423,11 +442,31 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
         setState(() {
           _isInitialized = false;
           _isCameraActive = false;
+          _lastError = e.toString();
         });
+      }
+      // Attempt recovery with delay
+      if (_initializationAttempts < QRScannerConfig.maxInitializationAttempts) {
+        Future.delayed(QRScannerConfig.recoveryDelay, _initializeCamera);
       }
     } finally {
       _isInitializing = false;
+      _cancelInitializationTimeout();
     }
+  }
+
+  void _onSuccessfulScan() {
+    setState(() {
+      _showSuccessAnimation = true;
+    });
+    // Reset animation after delay
+    Future.delayed(const Duration(milliseconds: 1500), () {
+      if (mounted) {
+        setState(() {
+          _showSuccessAnimation = false;
+        });
+      }
+    });
   }
 
   Future<void> _startImageStream() async {
@@ -441,14 +480,16 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
           _isCurrentlyScanning = true;
         });
 
+        final processingStart = DateTime.now();
         _isProcessing = true;
+
         try {
           final InputImage inputImage = InputImage.fromBytes(
             bytes: image.planes[0].bytes,
             metadata: InputImageMetadata(
               size: Size(image.width.toDouble(), image.height.toDouble()),
               rotation: InputImageRotation.rotation0deg,
-              format: Platform.isWindows ? InputImageFormat.bgra8888 : InputImageFormat.yuv420,
+              format: InputImageFormat.bgra8888,
               bytesPerRow: image.planes[0].bytesPerRow,
             ),
           );
@@ -458,24 +499,26 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
           if (barcodes.isNotEmpty) {
             for (final barcode in barcodes) {
               if (barcode.rawValue != null) {
-                // Debug output for raw QR data
                 if (_debugMode && barcode.rawValue != _lastDetectedData) {
-                  debugPrint('Raw QR Data detected: ${barcode.rawValue}');
-                  debugPrint('Format: ${barcode.format}');
-                  debugPrint('Type: ${barcode.type}');
+                  debugPrint('''
+QR Code Detected:
+---------------
+Raw Data: ${barcode.rawValue}
+Format: ${barcode.format}
+Type: ${barcode.type}
+---------------
+''');
                   _lastDetectedData = barcode.rawValue!;
+                  _performanceService.recordSuccessfulScan();
                 }
 
-                // Only process if it's different from the last detected code
                 if (barcode.rawValue != _lastDetectedData) {
                   if (_debugMode) {
-                    // In debug mode, process all QR codes
                     widget.onQRCodeDetected(barcode.rawValue!);
-                  } else {
-                    // In production, validate the QR code
-                    if (QRService.isValidEmployeeQR(barcode.rawValue!)) {
-                      widget.onQRCodeDetected(barcode.rawValue!);
-                    }
+                    _onSuccessfulScan();
+                  } else if (QRService.isValidEmployeeQR(barcode.rawValue!)) {
+                    widget.onQRCodeDetected(barcode.rawValue!);
+                    _onSuccessfulScan();
                   }
                 }
                 break;
@@ -485,39 +528,35 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
         } catch (e) {
           debugPrint('Error processing image: $e');
         } finally {
+          final processingTime = DateTime.now().difference(processingStart);
+          _performanceService.recordFrameProcessed(processingTime);
+          
           _isProcessing = false;
           setState(() {
             _isCurrentlyScanning = false;
           });
-          // Add a small delay before processing the next frame
-          await Future.delayed(_processingCooldown);
+          
+          // Adaptive frame delay based on processing time
+          final delay = processingTime > QRScannerConfig.maxProcessingTime
+              ? QRScannerConfig.processingCooldown
+              : Duration(milliseconds: (1000 / QRScannerConfig.targetFPS).round());
+          
+          await Future.delayed(delay);
         }
       });
     } catch (e) {
       debugPrint('Error starting image stream: $e');
       _isCameraActive = false;
+      if (mounted) {
+        setState(() {
+          _lastError = 'Failed to start camera stream';
+        });
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_cameras.isEmpty) {
-      return Container(
-        decoration: BoxDecoration(
-          border: Border.all(
-            color: Theme.of(context).colorScheme.outline,
-          ),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: const Center(
-          child: Text(
-            'لا توجد كاميرات متاحة',
-            style: TextStyle(color: Colors.red),
-          ),
-        ),
-      );
-    }
-
     return Stack(
       children: [
         Column(
@@ -546,6 +585,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                   ),
                   onChanged: (index) {
                     if (index != null) {
+                      _selectedCameraIndex = index;
                       _initializeCamera();
                     }
                   },
@@ -564,12 +604,31 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const CircularProgressIndicator(),
+                            if (_isInitializing)
+                              const CircularProgressIndicator()
+                            else
+                              Icon(
+                                Icons.camera_alt,
+                                size: 48,
+                                color: Theme.of(context).colorScheme.outline,
+                              ),
                             const SizedBox(height: 16),
+                            if (_lastError != null)
+                              Padding(
+                                padding: const EdgeInsets.all(8.0),
+                                child: Text(
+                                  _lastError!,
+                                  style: TextStyle(
+                                    color: Theme.of(context).colorScheme.error,
+                                  ),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
                             if (!_isInitializing)
-                              ElevatedButton(
+                              ElevatedButton.icon(
                                 onPressed: _initializeCamera,
-                                child: const Text('إعادة محاولة تشغيل الكاميرا'),
+                                icon: const Icon(Icons.refresh),
+                                label: const Text('إعادة محاولة تشغيل الكاميرا'),
                               ),
                           ],
                         ),
@@ -597,7 +656,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                           height: 200,
                         ),
                         // Debug information overlay
-                        if (_debugMode && _lastDetectedData.isNotEmpty)
+                        if (_debugMode)
                           Positioned(
                             bottom: 16,
                             left: 16,
@@ -608,10 +667,25 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                                 color: Colors.black.withOpacity(0.7),
                                 borderRadius: BorderRadius.circular(8),
                               ),
-                              child: Text(
-                                'Last QR: $_lastDetectedData',
-                                style: const TextStyle(color: Colors.white),
-                                textAlign: TextAlign.center,
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (_lastDetectedData.isNotEmpty)
+                                    Text(
+                                      'Last QR: $_lastDetectedData',
+                                      style: const TextStyle(color: Colors.white),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'FPS: ${_performanceService.frameRate.toStringAsFixed(1)} | '
+                                    'Proc: ${_performanceService.averageProcessingTime.toStringAsFixed(1)}ms',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ),
@@ -620,6 +694,24 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
             ),
           ],
         ),
+        // Success animation overlay
+        if (_showSuccessAnimation)
+          Positioned.fill(
+            child: AnimatedOpacity(
+              opacity: _showSuccessAnimation ? 1.0 : 0.0,
+              duration: const Duration(milliseconds: 200),
+              child: Container(
+                color: Colors.green.withOpacity(0.3),
+                child: Center(
+                  child: Icon(
+                    Icons.check_circle_outline,
+                    color: Colors.white,
+                    size: 100,
+                  ),
+                ),
+              ),
+            ),
+          ),
       ],
     );
   }
