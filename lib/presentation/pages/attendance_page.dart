@@ -295,14 +295,23 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
   bool _isInitialized = false;
   List<CameraDescription> _cameras = [];
   int _selectedCameraIndex = 0;
-  final BarcodeScanner _barcodeScanner = BarcodeScanner();
   bool _isProcessing = false;
   DateTime? _lastProcessedTime;
-  static const Duration _processingCooldown = Duration(milliseconds: 500);
+  static const Duration _processingCooldown = Duration(milliseconds: 100); // Reduced cooldown for faster scanning
   bool _isInitializing = false;
   bool _isCameraActive = false;
   final CameraService _cameraService = CameraService();
   RouteObserver<ModalRoute<void>>? _routeObserver;
+  
+  // Configure barcode scanner for QR codes only
+  final BarcodeScanner _barcodeScanner = BarcodeScanner(
+    formats: [BarcodeFormat.qrCode],
+  );
+
+  // Debug mode for raw QR data
+  bool _debugMode = true;
+  String _lastDetectedData = '';
+  bool _isCurrentlyScanning = false;
 
   @override
   void initState() {
@@ -380,7 +389,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
       
       final controller = CameraController(
         _cameras[indexToUse],
-        ResolutionPreset.medium,
+        ResolutionPreset.high, // Higher resolution for better QR detection
         enableAudio: false,
         imageFormatGroup: Platform.isWindows ? ImageFormatGroup.bgra8888 : ImageFormatGroup.jpeg,
       );
@@ -390,6 +399,16 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
 
       await controller.initialize();
       
+      // Configure camera for optimal QR scanning on Windows
+      if (Platform.isWindows) {
+        try {
+          await controller.setExposureMode(ExposureMode.auto);
+          debugPrint('Camera exposure mode set to auto');
+        } catch (e) {
+          debugPrint('Warning: Could not set exposure mode: $e');
+        }
+      }
+
       if (mounted) {
         setState(() {
           _selectedCameraIndex = indexToUse;
@@ -416,17 +435,13 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
     
     try {
       await _controller!.startImageStream((CameraImage image) async {
-        // Check processing cooldown
-        final now = DateTime.now();
-        if (_isProcessing || 
-            (_lastProcessedTime != null && 
-             now.difference(_lastProcessedTime!) < _processingCooldown)) {
-          return;
-        }
+        if (_isProcessing) return;
         
-        _isProcessing = true;
-        _lastProcessedTime = now;
+        setState(() {
+          _isCurrentlyScanning = true;
+        });
 
+        _isProcessing = true;
         try {
           final InputImage inputImage = InputImage.fromBytes(
             bytes: image.planes[0].bytes,
@@ -440,18 +455,42 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
 
           final List<Barcode> barcodes = await _barcodeScanner.processImage(inputImage);
           
-          for (final barcode in barcodes) {
-            if (barcode.rawValue != null && 
-                mounted &&
-                QRService.isValidEmployeeQR(barcode.rawValue!)) {
-              widget.onQRCodeDetected(barcode.rawValue!);
-              break;
+          if (barcodes.isNotEmpty) {
+            for (final barcode in barcodes) {
+              if (barcode.rawValue != null) {
+                // Debug output for raw QR data
+                if (_debugMode && barcode.rawValue != _lastDetectedData) {
+                  debugPrint('Raw QR Data detected: ${barcode.rawValue}');
+                  debugPrint('Format: ${barcode.format}');
+                  debugPrint('Type: ${barcode.type}');
+                  _lastDetectedData = barcode.rawValue!;
+                }
+
+                // Only process if it's different from the last detected code
+                if (barcode.rawValue != _lastDetectedData) {
+                  if (_debugMode) {
+                    // In debug mode, process all QR codes
+                    widget.onQRCodeDetected(barcode.rawValue!);
+                  } else {
+                    // In production, validate the QR code
+                    if (QRService.isValidEmployeeQR(barcode.rawValue!)) {
+                      widget.onQRCodeDetected(barcode.rawValue!);
+                    }
+                  }
+                }
+                break;
+              }
             }
           }
         } catch (e) {
           debugPrint('Error processing image: $e');
         } finally {
           _isProcessing = false;
+          setState(() {
+            _isCurrentlyScanning = false;
+          });
+          // Add a small delay before processing the next frame
+          await Future.delayed(_processingCooldown);
         }
       });
     } catch (e) {
@@ -479,65 +518,107 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
       );
     }
 
-    return Column(
+    return Stack(
       children: [
-        if (_cameras.length > 1)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8.0),
-            child: DropdownButtonFormField<int>(
-              value: _selectedCameraIndex,
-              decoration: InputDecoration(
-                labelText: 'اختر الكاميرا',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-              ),
-              items: List.generate(
-                _cameras.length,
-                (index) => DropdownMenuItem(
-                  value: index,
-                  child: Text(
-                    'كاميرا ${index + 1} - ${_cameras[index].name}',
-                    textDirection: TextDirection.rtl,
-                  ),
-                ),
-              ),
-              onChanged: (index) {
-                if (index != null) {
-                  _initializeCamera();
-                }
-              },
-            ),
-          ),
-        Expanded(
-          child: !_isInitialized || _controller == null
-              ? Container(
-                  decoration: BoxDecoration(
-                    border: Border.all(
-                      color: Theme.of(context).colorScheme.outline,
+        Column(
+          children: [
+            if (_cameras.length > 1)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8.0),
+                child: DropdownButtonFormField<int>(
+                  value: _selectedCameraIndex,
+                  decoration: InputDecoration(
+                    labelText: 'اختر الكاميرا',
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
                     ),
-                    borderRadius: BorderRadius.circular(8),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                   ),
-                  child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
+                  items: List.generate(
+                    _cameras.length,
+                    (index) => DropdownMenuItem(
+                      value: index,
+                      child: Text(
+                        'كاميرا ${index + 1} - ${_cameras[index].name}',
+                        textDirection: TextDirection.rtl,
+                      ),
+                    ),
+                  ),
+                  onChanged: (index) {
+                    if (index != null) {
+                      _initializeCamera();
+                    }
+                  },
+                ),
+              ),
+            Expanded(
+              child: !_isInitialized || _controller == null
+                  ? Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outline,
+                        ),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const CircularProgressIndicator(),
+                            const SizedBox(height: 16),
+                            if (!_isInitializing)
+                              ElevatedButton(
+                                onPressed: _initializeCamera,
+                                child: const Text('إعادة محاولة تشغيل الكاميرا'),
+                              ),
+                          ],
+                        ),
+                      ),
+                    )
+                  : Stack(
+                      alignment: Alignment.center,
                       children: [
-                        const CircularProgressIndicator(),
-                        const SizedBox(height: 16),
-                        if (!_isInitializing)
-                          ElevatedButton(
-                            onPressed: _initializeCamera,
-                            child: const Text('إعادة محاولة تشغيل الكاميرا'),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: CameraPreview(_controller!),
+                        ),
+                        // QR Code scanning overlay
+                        Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(
+                              color: _isCurrentlyScanning 
+                                ? Colors.green.withOpacity(0.5)
+                                : Colors.white.withOpacity(0.5),
+                              width: 2,
+                            ),
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          width: 200,
+                          height: 200,
+                        ),
+                        // Debug information overlay
+                        if (_debugMode && _lastDetectedData.isNotEmpty)
+                          Positioned(
+                            bottom: 16,
+                            left: 16,
+                            right: 16,
+                            child: Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withOpacity(0.7),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                'Last QR: $_lastDetectedData',
+                                style: const TextStyle(color: Colors.white),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
                           ),
                       ],
                     ),
-                  ),
-                )
-              : ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: CameraPreview(_controller!),
-                ),
+            ),
+          ],
         ),
       ],
     );
