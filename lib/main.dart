@@ -8,6 +8,7 @@ import 'core/providers/database_provider.dart';
 import 'core/providers/repository_provider.dart';
 import 'core/providers/service_provider.dart';
 import 'presentation/pages/dashboard_page.dart';
+import 'core/services/app_lifecycle_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -25,6 +26,10 @@ void main() async {
     await windowManager.show();
     await windowManager.focus();
   });
+
+  // Initialize app lifecycle service
+  final appLifecycleService = AppLifecycleService();
+  appLifecycleService.initialize();
 
   runApp(
     MultiProvider(

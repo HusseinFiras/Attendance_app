@@ -3,7 +3,10 @@ import 'package:camera_windows/camera_windows.dart';
 import 'package:camera_platform_interface/camera_platform_interface.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
+import 'dart:io';
 import 'dart:ui' as ui;
+import '../../../core/services/qr_service.dart';
+import '../../../core/services/camera_service.dart';
 
 class AttendancePage extends StatefulWidget {
   const AttendancePage({super.key});
@@ -31,11 +34,20 @@ class _AttendancePageState extends State<AttendancePage> {
     _dateController.text = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
   }
 
-  void _onQRCodeDetected(String employeeId) {
-    setState(() {
-      _idController.text = employeeId;
-      _updateDateTime();
-    });
+  void _onQRCodeDetected(String qrData) {
+    try {
+      if (QRService.isValidEmployeeQR(qrData)) {
+        final employeeId = QRService.getEmployeeId(qrData);
+        if (employeeId != null) {
+          setState(() {
+            _idController.text = employeeId.toString();
+            _updateDateTime();
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('Error processing QR data: $e');
+    }
   }
 
   @override
@@ -278,97 +290,174 @@ class QRScannerWidget extends StatefulWidget {
   State<QRScannerWidget> createState() => _QRScannerWidgetState();
 }
 
-class _QRScannerWidgetState extends State<QRScannerWidget> {
+class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingObserver, RouteAware {
   CameraController? _controller;
   bool _isInitialized = false;
   List<CameraDescription> _cameras = [];
   int _selectedCameraIndex = 0;
   final BarcodeScanner _barcodeScanner = BarcodeScanner();
   bool _isProcessing = false;
+  DateTime? _lastProcessedTime;
+  static const Duration _processingCooldown = Duration(milliseconds: 500);
+  bool _isInitializing = false;
+  bool _isCameraActive = false;
+  final CameraService _cameraService = CameraService();
+  RouteObserver<ModalRoute<void>>? _routeObserver;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initializeCamera();
   }
 
-  Future<void> _initializeCamera() async {
-    try {
-      _cameras = await availableCameras();
-      if (_cameras.isEmpty) {
-        debugPrint('No cameras available');
-        return;
-      }
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _routeObserver = RouteObserver<ModalRoute<void>>();
+    _routeObserver?.subscribe(this, ModalRoute.of(context)!);
+  }
 
-      await _switchCamera(_selectedCameraIndex);
-    } catch (e) {
-      debugPrint('Error initializing camera: $e');
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _routeObserver?.unsubscribe(this);
+    _disposeCamera();
+    _barcodeScanner.close();
+    super.dispose();
+  }
+
+  @override
+  void didPushNext() {
+    // Called when navigating away from this page
+    _disposeCamera();
+  }
+
+  @override
+  void didPopNext() {
+    // Called when returning to this page
+    if (!_isCameraActive && mounted) {
+      Future.delayed(const Duration(milliseconds: 500), _initializeCamera);
     }
   }
 
-  Future<void> _switchCamera(int index) async {
-    if (_controller != null) {
-      await _controller!.dispose();
-    }
-
-    _controller = CameraController(
-      _cameras[index],
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.bgra8888,
-    );
-
+  Future<void> _disposeCamera() async {
     try {
-      await _controller!.initialize();
+      _isCameraActive = false;
+      final controller = _controller;
+      if (controller != null) {
+        if (controller.value.isStreamingImages) {
+          await controller.stopImageStream();
+        }
+        await controller.dispose();
+        _controller = null;
+        _isInitialized = false;
+        await _cameraService.cleanupCamera();
+      }
+    } catch (e) {
+      debugPrint('Error disposing camera: $e');
+    }
+  }
+
+  Future<void> _initializeCamera() async {
+    if (_isInitializing || _isCameraActive) return;
+    _isInitializing = true;
+    
+    try {
+      if (_controller != null) {
+        await _disposeCamera();
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+
+      _cameras = await availableCameras();
+      if (_cameras.isEmpty) {
+        debugPrint('No cameras available');
+        _isInitializing = false;
+        return;
+      }
+
+      final indexToUse = _selectedCameraIndex < _cameras.length ? _selectedCameraIndex : 0;
+      
+      final controller = CameraController(
+        _cameras[indexToUse],
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: Platform.isWindows ? ImageFormatGroup.bgra8888 : ImageFormatGroup.jpeg,
+      );
+
+      _controller = controller;
+      _cameraService.registerCamera(controller);
+
+      await controller.initialize();
+      
       if (mounted) {
         setState(() {
-          _selectedCameraIndex = index;
+          _selectedCameraIndex = indexToUse;
           _isInitialized = true;
+          _isCameraActive = true;
         });
         await _startImageStream();
       }
     } catch (e) {
       debugPrint('Error initializing camera: $e');
+      if (mounted) {
+        setState(() {
+          _isInitialized = false;
+          _isCameraActive = false;
+        });
+      }
+    } finally {
+      _isInitializing = false;
     }
   }
 
   Future<void> _startImageStream() async {
-    await _controller?.startImageStream((CameraImage image) async {
-      if (_isProcessing) return;
-      _isProcessing = true;
-
-      try {
-        final InputImage inputImage = InputImage.fromBytes(
-          bytes: image.planes[0].bytes,
-          metadata: InputImageMetadata(
-            size: Size(image.width.toDouble(), image.height.toDouble()),
-            rotation: InputImageRotation.rotation0deg,
-            format: InputImageFormat.bgra8888,
-            bytesPerRow: image.planes[0].bytesPerRow,
-          ),
-        );
-
-        final List<Barcode> barcodes = await _barcodeScanner.processImage(inputImage);
-        
-        for (final barcode in barcodes) {
-          if (barcode.rawValue != null) {
-            widget.onQRCodeDetected(barcode.rawValue!);
-            break;
-          }
+    if (_controller == null || !_isCameraActive) return;
+    
+    try {
+      await _controller!.startImageStream((CameraImage image) async {
+        // Check processing cooldown
+        final now = DateTime.now();
+        if (_isProcessing || 
+            (_lastProcessedTime != null && 
+             now.difference(_lastProcessedTime!) < _processingCooldown)) {
+          return;
         }
-      } catch (e) {
-        debugPrint('Error processing image: $e');
-      } finally {
-        _isProcessing = false;
-      }
-    });
-  }
+        
+        _isProcessing = true;
+        _lastProcessedTime = now;
 
-  @override
-  void dispose() {
-    _controller?.dispose();
-    _barcodeScanner.close();
-    super.dispose();
+        try {
+          final InputImage inputImage = InputImage.fromBytes(
+            bytes: image.planes[0].bytes,
+            metadata: InputImageMetadata(
+              size: Size(image.width.toDouble(), image.height.toDouble()),
+              rotation: InputImageRotation.rotation0deg,
+              format: Platform.isWindows ? InputImageFormat.bgra8888 : InputImageFormat.yuv420,
+              bytesPerRow: image.planes[0].bytesPerRow,
+            ),
+          );
+
+          final List<Barcode> barcodes = await _barcodeScanner.processImage(inputImage);
+          
+          for (final barcode in barcodes) {
+            if (barcode.rawValue != null && 
+                mounted &&
+                QRService.isValidEmployeeQR(barcode.rawValue!)) {
+              widget.onQRCodeDetected(barcode.rawValue!);
+              break;
+            }
+          }
+        } catch (e) {
+          debugPrint('Error processing image: $e');
+        } finally {
+          _isProcessing = false;
+        }
+      });
+    } catch (e) {
+      debugPrint('Error starting image stream: $e');
+      _isCameraActive = false;
+    }
   }
 
   @override
@@ -416,7 +505,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> {
               ),
               onChanged: (index) {
                 if (index != null) {
-                  _switchCamera(index);
+                  _initializeCamera();
                 }
               },
             ),
@@ -430,8 +519,19 @@ class _QRScannerWidgetState extends State<QRScannerWidget> {
                     ),
                     borderRadius: BorderRadius.circular(8),
                   ),
-                  child: const Center(
-                    child: CircularProgressIndicator(),
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const CircularProgressIndicator(),
+                        const SizedBox(height: 16),
+                        if (!_isInitializing)
+                          ElevatedButton(
+                            onPressed: _initializeCamera,
+                            child: const Text('إعادة محاولة تشغيل الكاميرا'),
+                          ),
+                      ],
+                    ),
                   ),
                 )
               : ClipRRect(
@@ -442,4 +542,4 @@ class _QRScannerWidgetState extends State<QRScannerWidget> {
       ],
     );
   }
-} 
+}
