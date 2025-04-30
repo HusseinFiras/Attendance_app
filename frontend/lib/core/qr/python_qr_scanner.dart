@@ -4,6 +4,8 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'pipe_communicator.dart';
+import 'python_backend_manager.dart';
+import 'qr_communicator.dart';
 
 class QRScanResult {
   final String data;
@@ -69,127 +71,101 @@ class QRScanResponse {
 }
 
 class PythonQRScanner {
-  final void Function(String) onQRDetected;
-  final PipeCommunicator _communicator = PipeCommunicator();
+  final Function(String) onQRDetected;
+  final PythonBackendManager _backendManager;
+  final QRCommunicator _communicator;
   
-  bool _isProcessing = false;
-  String? _lastDetectedData;
-  DateTime? _lastProcessTime;
-  
-  // Debug information
-  QRScanResponse? _lastResponse;
-  QRScanResponse? get lastResponse => _lastResponse;
-  
-  PythonQRScanner({required this.onQRDetected});
-  
-  Future<QRScanResponse?> testConnection() async {
+  bool _isBackendRunning = false;
+  bool _isPipeAvailable = false;
+  QRResponse? lastResponse;
+  DateTime? _lastFrameTime;
+  static const Duration _minFrameInterval = Duration(milliseconds: 100);
+
+  PythonQRScanner({
+    required this.onQRDetected,
+  }) : _backendManager = PythonBackendManager(),
+       _communicator = QRCommunicator();
+
+  PythonBackendManager get backendManager => _backendManager;
+
+  Future<bool> initialize() async {
     try {
-      // Create a test request with a small black image
-      final testImage = Uint8List(100 * 100 * 4); // 100x100 black image in BGRA format
-      final base64Image = base64Encode(testImage);
-      
-      final request = json.encode({
-        'image': base64Image,
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-      });
-      
-      final responseJson = await _communicator.sendMessage(request);
-      if (responseJson == null) {
-        return null;
+      // Start the backend
+      _isBackendRunning = await _backendManager.startBackend();
+      if (!_isBackendRunning) {
+        debugPrint('Failed to start backend process');
+        return false;
       }
-      
-      final Map<String, dynamic> responseMap = json.decode(responseJson);
-      if (responseMap.containsKey('error')) {
-        debugPrint('Test connection error: ${responseMap['error']}');
-        return null;
+
+      // Wait for backend to initialize
+      await Future.delayed(const Duration(seconds: 2));
+
+      // Verify pipe is available
+      _isPipeAvailable = await _communicator.isPipeAvailable();
+      if (!_isPipeAvailable) {
+        debugPrint('Pipe server not available');
+        return false;
       }
-      
-      return QRScanResponse.fromJson(responseMap);
+
+      // Test communication
+      final testResult = await testConnection();
+      if (testResult == null) {
+        debugPrint('Failed to establish communication with backend');
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      debugPrint('Error during QR scanner initialization: $e');
+      return false;
+    }
+  }
+
+  Future<QRResponse?> testConnection() async {
+    try {
+      final response = await _communicator.sendTestMessage();
+      return response;
     } catch (e) {
       debugPrint('Test connection failed: $e');
       return null;
     }
   }
-  
+
   Future<void> processFrame(CameraImage frame) async {
-    // Skip if already processing or not enough time passed
-    if (_isProcessing) return;
-    
-    final now = DateTime.now();
-    if (_lastProcessTime != null) {
-      final elapsed = now.difference(_lastProcessTime!);
-      if (elapsed.inMilliseconds < 100) {  // Max 10 FPS for processing
-        return;
-      }
+    // Skip if backend not ready
+    if (!_isBackendRunning || !_isPipeAvailable) {
+      return;
     }
-    
-    _isProcessing = true;
-    _lastProcessTime = now;
-    
+
+    // Rate limiting
+    final now = DateTime.now();
+    if (_lastFrameTime != null && 
+        now.difference(_lastFrameTime!) < _minFrameInterval) {
+      return;
+    }
+    _lastFrameTime = now;
+
     try {
-      // Convert frame to base64
-      final bytes = _convertFrameToBytes(frame);
-      final base64Image = base64Encode(bytes);
-      
-      // Create request JSON
-      final request = json.encode({
-        'image': base64Image,
-        'timestamp': now.millisecondsSinceEpoch,
-      });
-      
-      // Send to Python backend
-      final responseJson = await _communicator.sendMessage(request);
-      if (responseJson == null) {
-        return;
-      }
-      
-      // Parse response
-      final Map<String, dynamic> responseMap = json.decode(responseJson);
-      if (responseMap.containsKey('error')) {
-        debugPrint('QR processing error: ${responseMap['error']}');
-        return;
-      }
-      
-      // Create response object
-      final response = QRScanResponse.fromJson(responseMap);
-      _lastResponse = response;
-      
-      // Process QR results
-      if (response.results.isNotEmpty) {
-        // Get first valid QR code
-        final validResults = response.results.where((r) => r.isValid).toList();
-        if (validResults.isNotEmpty) {
-          final qrData = validResults.first.data;
-          
-          // Notify if new QR code detected
-          if (qrData != _lastDetectedData) {
-            _lastDetectedData = qrData;
-            onQRDetected(qrData);
-          }
-        }
+      final response = await _communicator.sendFrame(frame);
+      lastResponse = response;
+
+      if (response != null && response.results.isNotEmpty) {
+        final qrData = response.results.first.data;
+        onQRDetected(qrData);
       }
     } catch (e) {
       debugPrint('Error processing frame: $e');
-    } finally {
-      _isProcessing = false;
+      // Attempt to recover if pipe error
+      if (e.toString().contains('pipe')) {
+        _isPipeAvailable = false;
+        await initialize();
+      }
     }
-  }
-  
-  Uint8List _convertFrameToBytes(CameraImage image) {
-    // Handle BGRA format (Windows)
-    if (image.format.group == ImageFormatGroup.bgra8888) {
-      // For Windows, we get direct access to the pixel data
-      return image.planes[0].bytes;
-    }
-    
-    // Fallback for other formats (unlikely on Windows)
-    throw UnsupportedError('Unsupported image format: ${image.format.group}');
   }
 
   void dispose() {
-    _isProcessing = false;
-    _lastDetectedData = null;
-    _lastProcessTime = null;
-    _lastResponse = null;
+    _backendManager.stopBackend();
+    _isBackendRunning = false;
+    _isPipeAvailable = false;
   }
 } 

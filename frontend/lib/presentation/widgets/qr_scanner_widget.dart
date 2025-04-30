@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import '../../core/services/camera_service.dart';
 import '../../core/qr/python_qr_scanner.dart';
 import '../../core/backend/python_backend_manager.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 // Register the Windows camera plugin
 void _initializeWindowsCamera() {
@@ -43,6 +44,15 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
   bool _backendStarted = false;
   bool _isProcessing = false;
   bool _isDisposed = false;
+  
+  // New status tracking variables
+  bool _isBackendInitializing = false;
+  bool _isBackendInitialized = false;
+  bool _isCameraInitializing = false;
+  bool _isPipeAvailable = false;
+  String _statusMessage = 'Initializing...';
+  int _initializationAttempts = 0;
+  static const int _maxInitializationAttempts = 3;
 
   @override
   void initState() {
@@ -54,38 +64,60 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
       onQRDetected: widget.onQRCodeDetected,
     );
     
-    _startBackendAndCamera();
+    _initializeScanner();
   }
 
-  Future<bool> _verifyBackendReady() async {
-    try {
-      // Send a test message to verify backend is ready
-      final response = await _qrScanner.testConnection();
-      return response != null;
-    } catch (e) {
-      debugPrint('Backend verification failed: $e');
-      return false;
-    }
-  }
-
-  Future<void> _restartBackend() async {
+  Future<void> _initializeScanner() async {
     if (_isDisposed) return;
     
+    setState(() {
+      _isBackendInitializing = true;
+      _statusMessage = 'Initializing backend...';
+      _lastError = null;
+    });
+
     try {
-      await _backendManager.stopBackend();
-      _backendStarted = false;
-      await _startBackendAndCamera();
+      // Initialize backend first
+      final backendResult = await _qrScanner.initialize();
+      
+      if (!backendResult) {
+        throw Exception('Failed to initialize backend');
+      }
+
+      setState(() {
+        _isBackendInitialized = true;
+        _isBackendInitializing = false;
+        _isCameraInitializing = true;
+        _statusMessage = 'Initializing camera...';
+      });
+
+      // Then initialize camera
+      await _initializeCamera();
+      
+      setState(() {
+        _isCameraInitializing = false;
+        _statusMessage = 'Ready to scan';
+      });
     } catch (e) {
-      debugPrint('Error restarting backend: $e');
-      if (mounted) {
+      debugPrint('Scanner initialization error: $e');
+      if (mounted && !_isDisposed) {
         setState(() {
-          _lastError = 'Failed to restart backend';
+          _lastError = e.toString();
+          _statusMessage = 'Initialization failed';
+          _isBackendInitializing = false;
+          _isCameraInitializing = false;
         });
+        
+        // Retry initialization if attempts haven't been exhausted
+        if (_initializationAttempts < _maxInitializationAttempts) {
+          _initializationAttempts++;
+          Future.delayed(const Duration(seconds: 2), _initializeScanner);
+        }
       }
     }
   }
-  
-  Future<void> _startBackendAndCamera() async {
+
+  Future<void> _initializeCamera() async {
     if (_isDisposed) return;
     
     try {
@@ -115,9 +147,12 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
           _selectedCameraIndex = indexToUse;
           _isInitialized = true;
           _isCameraActive = true;
-          _lastError = null;
         });
-        await _startImageStream();
+        
+        // Only start image stream after both backend and camera are ready
+        if (_isBackendInitialized) {
+          await _startImageStream();
+        }
       }
     } catch (e) {
       debugPrint('Error initializing camera: $e');
@@ -128,6 +163,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
           _lastError = e.toString();
         });
       }
+      rethrow;
     }
   }
 
@@ -150,7 +186,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
       _disposeCamera();
     } else if (state == AppLifecycleState.resumed) {
       if (_controller == null) {
-        _startBackendAndCamera();
+        _initializeScanner();
       }
     }
   }
@@ -203,7 +239,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
             debugPrint('QR processing error: $e');
             // Attempt to restart backend if needed
             if (e.toString().contains('pipe')) {
-              await _restartBackend();
+              await _initializeScanner();
             }
           }
         }
@@ -250,7 +286,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                   onChanged: (index) {
                     if (index != null && !_isDisposed) {
                       _selectedCameraIndex = index;
-                      _startBackendAndCamera();
+                      _initializeScanner();
                     }
                   },
                 ),
@@ -268,7 +304,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            if (_isInitializing)
+                            if (_isInitializing || _isBackendInitializing || _isCameraInitializing)
                               const CircularProgressIndicator()
                             else
                               Icon(
@@ -277,6 +313,11 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                                 color: Theme.of(context).colorScheme.outline,
                               ),
                             const SizedBox(height: 16),
+                            Text(
+                              _statusMessage,
+                              style: Theme.of(context).textTheme.bodyLarge,
+                              textAlign: TextAlign.center,
+                            ),
                             if (_lastError != null)
                               Padding(
                                 padding: const EdgeInsets.all(8.0),
@@ -288,9 +329,73 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                                   textAlign: TextAlign.center,
                                 ),
                               ),
-                            if (!_isInitializing)
+                            if (_qrScanner.backendManager.lastError != null)
+                              Padding(
+                                padding: const EdgeInsets.all(8.0),
+                                child: Column(
+                                  children: [
+                                    Text(
+                                      'Backend Error:',
+                                      style: TextStyle(
+                                        color: Theme.of(context).colorScheme.error,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      _qrScanner.backendManager.lastError!,
+                                      style: TextStyle(
+                                        color: Theme.of(context).colorScheme.error,
+                                      ),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                    if (_qrScanner.backendManager.lastError!.contains('pip') ||
+                                        _qrScanner.backendManager.lastError!.contains('Python'))
+                                      Padding(
+                                        padding: const EdgeInsets.only(top: 8.0),
+                                        child: Column(
+                                          children: [
+                                            Text(
+                                              'Python Installation Required:',
+                                              style: TextStyle(
+                                                color: Theme.of(context).colorScheme.error,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                              textAlign: TextAlign.center,
+                                            ),
+                                            const SizedBox(height: 8),
+                                            Text(
+                                              '1. Download and install Python 3.9 or later from python.org\n'
+                                              '2. During installation, check "Add Python to PATH"\n'
+                                              '3. Restart the application after installation',
+                                              style: TextStyle(
+                                                color: Theme.of(context).colorScheme.error,
+                                                fontStyle: FontStyle.italic,
+                                              ),
+                                              textAlign: TextAlign.center,
+                                            ),
+                                            const SizedBox(height: 8),
+                                            TextButton.icon(
+                                              onPressed: () async {
+                                                // Open Python download page
+                                                final url = Uri.parse('https://www.python.org/downloads/');
+                                                if (await canLaunch(url.toString())) {
+                                                  await launch(url.toString());
+                                                }
+                                              },
+                                              icon: const Icon(Icons.download),
+                                              label: const Text('Download Python'),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            if (!_isInitializing && !_isBackendInitializing && !_isCameraInitializing)
                               ElevatedButton.icon(
-                                onPressed: _startBackendAndCamera,
+                                onPressed: _initializeScanner,
                                 icon: const Icon(Icons.refresh),
                                 label: const Text('إعادة محاولة التشغيل'),
                               ),
@@ -318,6 +423,51 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                           ),
                           width: 200,
                           height: 200,
+                        ),
+                        
+                        // Status overlay
+                        Positioned(
+                          top: 8,
+                          left: 8,
+                          right: 8,
+                          child: Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withOpacity(0.7),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      _isBackendInitialized ? Icons.check_circle : Icons.error,
+                                      color: _isBackendInitialized ? Colors.green : Colors.red,
+                                      size: 16,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      _statusMessage,
+                                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                                    ),
+                                  ],
+                                ),
+                                if (_qrScanner.backendManager.lastError != null)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 4),
+                                    child: Text(
+                                      'Backend: ${_qrScanner.backendManager.lastError}',
+                                      style: const TextStyle(color: Colors.red, fontSize: 10),
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
                         ),
                         
                         // Debug info overlay
