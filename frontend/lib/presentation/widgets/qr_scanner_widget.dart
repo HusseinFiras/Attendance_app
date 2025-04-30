@@ -1,8 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+import 'package:camera_windows/camera_windows.dart';
+import 'package:camera_platform_interface/camera_platform_interface.dart';
+import 'package:flutter/foundation.dart';
 import '../../core/services/camera_service.dart';
 import '../../core/qr/python_qr_scanner.dart';
 import '../../core/backend/python_backend_manager.dart';
+
+// Register the Windows camera plugin
+void _initializeWindowsCamera() {
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    CameraPlatform.instance = CameraWindows();
+  }
+}
 
 class QRScannerWidget extends StatefulWidget {
   final Function(String) onQRCodeDetected;
@@ -37,17 +47,11 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
   @override
   void initState() {
     super.initState();
+    _initializeWindowsCamera();
     WidgetsBinding.instance.addObserver(this);
     
     _qrScanner = PythonQRScanner(
-      onQRDetected: (qrData) {
-        if (!_isProcessing && !_isDisposed) {
-          _isProcessing = true;
-          widget.onQRCodeDetected(qrData);
-          _onSuccessfulScan();
-          _isProcessing = false;
-        }
-      },
+      onQRDetected: widget.onQRCodeDetected,
     );
     
     _startBackendAndCamera();
@@ -82,37 +86,48 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
   }
   
   Future<void> _startBackendAndCamera() async {
-    if (!_backendStarted && !_isDisposed) {
-      try {
-        final success = await _backendManager.startBackend();
-        if (success) {
-          // Wait for backend to be ready
-          bool isReady = false;
-          for (int i = 0; i < 5; i++) { // Try 5 times
-            isReady = await _verifyBackendReady();
-            if (isReady) break;
-            await Future.delayed(const Duration(seconds: 1));
-          }
-          
-          if (isReady) {
-            _backendStarted = true;
-            await _initializeCamera();
-          } else {
-            throw Exception('Backend failed to initialize');
-          }
-        } else {
-          throw Exception('Failed to start backend process');
-        }
-      } catch (e) {
-        debugPrint('Error starting backend: $e');
-        if (mounted) {
-          setState(() {
-            _lastError = 'Error starting backend: $e';
-          });
-        }
+    if (_isDisposed) return;
+    
+    try {
+      _cameras = await availableCameras();
+      if (_cameras.isEmpty) {
+        throw Exception('No cameras available');
       }
-    } else if (!_isDisposed) {
-      await _initializeCamera();
+
+      final indexToUse = _selectedCameraIndex < _cameras.length ? _selectedCameraIndex : 0;
+      
+      final controller = CameraController(
+        _cameras[indexToUse],
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: defaultTargetPlatform == TargetPlatform.windows 
+          ? ImageFormatGroup.bgra8888 
+          : ImageFormatGroup.yuv420,
+      );
+
+      _controller = controller;
+      _cameraService.registerCamera(controller);
+
+      await controller.initialize();
+      
+      if (mounted && !_isDisposed) {
+        setState(() {
+          _selectedCameraIndex = indexToUse;
+          _isInitialized = true;
+          _isCameraActive = true;
+          _lastError = null;
+        });
+        await _startImageStream();
+      }
+    } catch (e) {
+      debugPrint('Error initializing camera: $e');
+      if (mounted && !_isDisposed) {
+        setState(() {
+          _isInitialized = false;
+          _isCameraActive = false;
+          _lastError = e.toString();
+        });
+      }
     }
   }
 
@@ -135,7 +150,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
       _disposeCamera();
     } else if (state == AppLifecycleState.resumed) {
       if (_controller == null) {
-        _initializeCamera();
+        _startBackendAndCamera();
       }
     }
   }
@@ -173,59 +188,6 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
       }
     } catch (e) {
       debugPrint('Error disposing camera: $e');
-    }
-  }
-
-  Future<void> _initializeCamera() async {
-    if (_isInitializing || _isCameraActive || _isDisposed) return;
-    
-    _isInitializing = true;
-    
-    try {
-      if (_controller != null) {
-        await _disposeCamera();
-        await Future.delayed(const Duration(milliseconds: 300));
-      }
-
-      _cameras = await availableCameras();
-      if (_cameras.isEmpty) {
-        throw Exception('No cameras available');
-      }
-
-      final indexToUse = _selectedCameraIndex < _cameras.length ? _selectedCameraIndex : 0;
-      
-      final controller = CameraController(
-        _cameras[indexToUse],
-        ResolutionPreset.medium,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.bgra8888, // Windows format
-      );
-
-      _controller = controller;
-      _cameraService.registerCamera(controller);
-
-      await controller.initialize();
-      
-      if (mounted && !_isDisposed) {
-        setState(() {
-          _selectedCameraIndex = indexToUse;
-          _isInitialized = true;
-          _isCameraActive = true;
-          _lastError = null;
-        });
-        await _startImageStream();
-      }
-    } catch (e) {
-      debugPrint('Error initializing camera: $e');
-      if (mounted && !_isDisposed) {
-        setState(() {
-          _isInitialized = false;
-          _isCameraActive = false;
-          _lastError = e.toString();
-        });
-      }
-    } finally {
-      _isInitializing = false;
     }
   }
 
@@ -288,7 +250,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                   onChanged: (index) {
                     if (index != null && !_isDisposed) {
                       _selectedCameraIndex = index;
-                      _initializeCamera();
+                      _startBackendAndCamera();
                     }
                   },
                 ),
@@ -375,7 +337,7 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text(
-                                    'FPS: ${1000 / (_qrScanner.lastResponse?.averageTimeMs ?? 1000):.1f} | Proc: ${_qrScanner.lastResponse?.processingTimeMs.toStringAsFixed(1)}ms',
+                                    'FPS: ${(1000 / (_qrScanner.lastResponse?.averageTimeMs ?? 1000)).toStringAsFixed(1)} | Proc: ${_qrScanner.lastResponse?.processingTimeMs.toStringAsFixed(1)}ms',
                                     style: const TextStyle(color: Colors.white, fontSize: 12),
                                   ),
                                   if (_qrScanner.lastResponse?.results.isNotEmpty ?? false)
