@@ -6,10 +6,11 @@ import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart
 import 'dart:io';
 import 'dart:async';
 import 'dart:ui' as ui;
-import '../../../core/services/qr_service.dart';
-import '../../../core/services/camera_service.dart';
-import '../../../core/services/scanner_performance_service.dart';
-import '../../../core/config/qr_scanner_config.dart';
+import '../../core/services/qr_service.dart';
+import '../../core/services/camera_service.dart';
+import '../../core/services/scanner_performance_service.dart';
+import '../../core/config/qr_scanner_config.dart';
+import '../../core/utils/image_converter.dart';
 
 class AttendancePage extends StatefulWidget {
   const AttendancePage({super.key});
@@ -484,15 +485,11 @@ class _QRScannerWidgetState extends State<QRScannerWidget> with WidgetsBindingOb
         _isProcessing = true;
 
         try {
-          final InputImage inputImage = InputImage.fromBytes(
-            bytes: image.planes[0].bytes,
-            metadata: InputImageMetadata(
-              size: Size(image.width.toDouble(), image.height.toDouble()),
-              rotation: InputImageRotation.rotation0deg,
-              format: InputImageFormat.bgra8888,
-              bytesPerRow: image.planes[0].bytesPerRow,
-            ),
-          );
+          final inputImage = ImageConverter.convertCameraImage(image);
+          if (inputImage == null) {
+            debugPrint('Failed to convert camera image');
+            return;
+          }
 
           final List<Barcode> barcodes = await _barcodeScanner.processImage(inputImage);
           
