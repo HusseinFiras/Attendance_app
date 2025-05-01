@@ -418,12 +418,20 @@ if __name__ == '__main__':
 
       String? pipeName;
       bool pipeReady = false;
+      bool componentsInitialized = false;
       final completer = Completer<bool>();
 
       // Listen for process output
       _process?.stdout.listen((data) {
         final output = String.fromCharCodes(data);
         debugPrint('Backend stdout: $output');
+        
+        // Look for initialization messages
+        if (output.contains('OpenCV initialized successfully') &&
+            output.contains('pyzbar initialized successfully') &&
+            output.contains('win32pipe initialized successfully')) {
+          componentsInitialized = true;
+        }
         
         // Look for pipe ready message
         if (output.contains('PIPE_READY:')) {
@@ -435,7 +443,7 @@ if __name__ == '__main__':
           final pipeFile = File('pipe_name.txt');
           pipeFile.writeAsStringSync(pipeName!);
           
-          if (!completer.isCompleted) {
+          if (!completer.isCompleted && componentsInitialized) {
             completer.complete(true);
           }
         }
@@ -444,7 +452,8 @@ if __name__ == '__main__':
       _process?.stderr.listen((data) {
         final error = String.fromCharCodes(data);
         debugPrint('Backend stderr: $error');
-        if (error.contains('Server error:')) {
+        if (error.contains('Failed to initialize components') || 
+            error.contains('Server error:')) {
           _lastError = error;
           if (!completer.isCompleted) {
             completer.complete(false);
@@ -460,7 +469,7 @@ if __name__ == '__main__':
       try {
         success = await Future.any([
           completer.future,
-          Future.delayed(const Duration(seconds: 10)).then((_) {
+          Future.delayed(const Duration(seconds: 15)).then((_) {
             if (!completer.isCompleted) {
               debugPrint('Backend initialization timed out');
               completer.complete(false);
@@ -474,8 +483,11 @@ if __name__ == '__main__':
       }
       
       // Check if process is still running and pipe was created
-      if (!success || _process?.exitCode != null || !pipeReady) {
+      if (!success || _process?.exitCode != null || !pipeReady || !componentsInitialized) {
         _lastError = 'Backend process failed to initialize properly';
+        if (!pipeReady) _lastError = '$_lastError (Pipe not ready)';
+        if (!componentsInitialized) _lastError = '$_lastError (Components not initialized)';
+        if (_process?.exitCode != null) _lastError = '$_lastError (Process exited with code ${_process?.exitCode})';
         debugPrint(_lastError);
         await stopBackend();
         return false;

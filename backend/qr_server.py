@@ -8,6 +8,7 @@ import threading
 import os
 import time
 import sys
+import traceback
 
 PIPE_NAME = r'\\.\pipe\attendance_qr_scanner'
 DEBUG_MODE = True
@@ -19,8 +20,42 @@ successful_detections = 0
 
 def log(message):
     if DEBUG_MODE:
-        print(f"[QRServer] {message}")
+        print(f"[QRServer] {message}", file=sys.stderr)
+        sys.stderr.flush()
+
+def initialize_components():
+    """Initialize all required components and verify they work"""
+    try:
+        # Test OpenCV
+        log("Testing OpenCV...")
+        test_image = np.zeros((100, 100, 3), dtype=np.uint8)
+        cv2.imencode('.jpg', test_image)
+        log("OpenCV initialized successfully")
+        
+        # Test pyzbar
+        log("Testing pyzbar...")
+        test_qr = pyzbar.decode(test_image)
+        log("pyzbar initialized successfully")
+        
+        # Test win32pipe
+        log("Testing win32pipe...")
+        test_pipe = win32pipe.CreateNamedPipe(
+            PIPE_NAME,
+            win32pipe.PIPE_ACCESS_DUPLEX,
+            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+            1, 65536, 65536, 0, None)
+        win32file.CloseHandle(test_pipe)
+        log("win32pipe initialized successfully")
+        
+        # Print initialization complete message
+        print("INIT_COMPLETE", file=sys.stdout)
         sys.stdout.flush()
+        
+        return True
+    except Exception as e:
+        log(f"Component initialization failed: {str(e)}")
+        log(f"Stack trace: {traceback.format_exc()}")
+        return False
 
 def process_qr_image(image_data):
     global total_frames, successful_detections, processing_times
@@ -126,6 +161,11 @@ def process_qr_image(image_data):
 def server_thread():
     log("QR Server starting...")
     
+    # Initialize components first
+    if not initialize_components():
+        log("Failed to initialize components, exiting...")
+        return
+    
     while True:
         try:
             pipe = win32pipe.CreateNamedPipe(
@@ -133,6 +173,10 @@ def server_thread():
                 win32pipe.PIPE_ACCESS_DUPLEX,
                 win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
                 1, 65536, 65536, 0, None)
+            
+            log("Pipe created successfully")
+            print(f"PIPE_READY:{PIPE_NAME}", file=sys.stdout)
+            sys.stdout.flush()
             
             log("Waiting for client connection...")
             win32pipe.ConnectNamedPipe(pipe, None)
@@ -156,9 +200,11 @@ def server_thread():
                     win32file.WriteFile(pipe, result.encode('utf-8'))
                 except Exception as e:
                     log(f"Error in pipe communication: {str(e)}")
+                    log(f"Stack trace: {traceback.format_exc()}")
                     break
         except Exception as e:
             log(f"Error creating pipe: {str(e)}")
+            log(f"Stack trace: {traceback.format_exc()}")
             time.sleep(1)  # Wait before retrying
         finally:
             try:
@@ -167,16 +213,21 @@ def server_thread():
                 pass
 
 if __name__ == "__main__":
-    log(f"QR Server v1.0 starting on pipe: {PIPE_NAME}")
-    
-    # Start server thread
-    server = threading.Thread(target=server_thread)
-    server.daemon = True
-    server.start()
-    
-    # Keep main thread alive
     try:
-        while True:
+        log(f"QR Server v1.0 starting on pipe: {PIPE_NAME}")
+        
+        # Start server thread
+        server = threading.Thread(target=server_thread)
+        server.daemon = True
+        server.start()
+        
+        # Keep main thread alive and monitor server thread
+        while server.is_alive():
             time.sleep(1)
-    except KeyboardInterrupt:
+            
+        log("Server thread died unexpectedly")
+    except Exception as e:
+        log(f"Fatal error in main thread: {str(e)}")
+        log(f"Stack trace: {traceback.format_exc()}")
+    finally:
         log("Server shutting down...") 

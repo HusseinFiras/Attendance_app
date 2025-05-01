@@ -1,1 +1,1 @@
-\\.\pipe\flutter_qr_pipe_fb41e39290974b53b941c3d38f2a6d3e
+\\.\pipe\flutter_qr_pipe_9695c7baf9264cbcb7f2697820823538

@@ -4,9 +4,9 @@
 a = Analysis(
     ['qr_server.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('temp\\zbar\\bin\\libzbar-0.dll', '.')],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['pyzbar.pyzbar', 'win32pipe', 'win32file'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
